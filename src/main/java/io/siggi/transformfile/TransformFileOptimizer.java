@@ -1,11 +1,17 @@
 package io.siggi.transformfile;
 
+import io.siggi.transformfile.io.LimitInputStream;
 import io.siggi.transformfile.io.RafInputStream;
 
+import io.siggi.transformfile.io.Util;
 import io.siggi.transformfile.packet.PacketIO;
+import io.siggi.transformfile.packet.types.PacketCloseFile;
 import io.siggi.transformfile.packet.types.PacketEnd;
 import io.siggi.transformfile.packet.types.PacketFileList;
 import io.siggi.transformfile.packet.types.PacketFileName;
+
+import io.siggi.transformfile.packet.types.PacketOffsets;
+import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
@@ -15,6 +21,8 @@ import static io.siggi.transformfile.io.Util.*;
 
 public class TransformFileOptimizer {
     public static void optimize(TransformFile tf, FileOutputStream out) throws IOException {
+        tf.loadChunks();
+
         boolean[] use = new boolean[tf.files.length];
         for (DataChunk chunk : tf.chunks) {
             use[chunk.file] = true;
@@ -56,15 +64,50 @@ public class TransformFileOptimizer {
             chunks.add(chunk);
         }
 
+        long resultFileSize = 0L;
+        long nonRedundantSize = 0L;
+        long[] highestPoint = new long[newFiles.size()];
+
         for (DataChunk chunk : chunks) {
-            packetIO.write(out, chunk);
+            resultFileSize = chunk.transformedOffset + chunk.length;
+            int fileIndex = chunk.file;
+            if (fileIndex < 1) {
+                nonRedundantSize = Math.max(nonRedundantSize, chunk.offset + chunk.length);
+                continue;
+            }
+            highestPoint[fileIndex - 1] = chunk.transformedOffset + chunk.length;
         }
-        packetIO.write(out, PacketEnd.instance);
+
+        List<Long> offsets = new LinkedList<>();
+
+        ByteArrayOutputStream chunksBuffer = new ByteArrayOutputStream();
+        for (DataChunk chunk : chunks) {
+            long offsetOfLastByte = chunk.transformedOffset + chunk.length - 1L;
+            long offsetFromStartOfChunks = chunksBuffer.size();
+            int indexAddress = (int) (offsetOfLastByte / 131072L);
+            while (offsets.size() <= indexAddress) offsets.add(offsetFromStartOfChunks);
+            packetIO.write(chunksBuffer, chunk);
+            int fileIndex = chunk.file;
+            if (fileIndex < 1) continue;
+            long highPoint = highestPoint[fileIndex - 1];
+            if (chunk.transformedOffset + chunk.length == highPoint) {
+                packetIO.write(chunksBuffer, new PacketCloseFile(fileIndex));
+            }
+        }
+        packetIO.write(chunksBuffer, PacketEnd.instance);
+
+        int chunksBufferSize = chunksBuffer.size();
+        packetIO.write(out, new PacketOffsets(chunksBufferSize, chunksBufferSize + nonRedundantSize, resultFileSize));
+        chunksBuffer.writeTo(out);
 
         RandomAccessFile raf = tf.rafs[0];
         raf.seek(tf.dataFileOffset);
-        RafInputStream in = new RafInputStream(raf, false);
+        LimitInputStream in = new LimitInputStream(new RafInputStream(raf, false), nonRedundantSize, false);
         copy(in, out);
+
+        for (long l : offsets) {
+            Util.writeLong(out, l);
+        }
     }
 
     private static DataChunk combine(DataChunk chunk1, DataChunk chunk2) {
